@@ -30,8 +30,13 @@ bridge[LP.Name] = {
 local function getBridgePeers()
     local peers = {}
     for name, data in pairs(bridge) do
-        if name ~= LP.Name and data.player and data.player.Parent then
-            table.insert(peers, data)
+        if name ~= LP.Name and data.player then
+            -- verify the player is actually still in the game
+            local realPlayer = Players:FindFirstChild(name)
+            if realPlayer then
+                data.player = realPlayer  -- keep reference fresh
+                table.insert(peers, data)
+            end
         end
     end
     return peers
@@ -638,7 +643,6 @@ do
             local jn = myBridge.acceptedFrom
             myBridge.acceptedFrom = nil
             local jp = Players:FindFirstChild(jn)
-            -- if the other player still exists and isn't already in party, add them
             if jp and not isInParty(jp) then
                 table.insert(partyMembers, jp)
                 pendingInvites[jn]=nil
@@ -671,8 +675,9 @@ do
     task.spawn(function()
         while true do
             task.wait(1.5)
-            if screens.lobby.Visible then
-                rebuildPeers(); checkIncomingInvites()
+            -- always poll regardless of whether lobby is open or closed
+            rebuildPeers(); checkIncomingInvites()
+            if tabExpanded then
                 bodyL:ApplyLayout()
                 body.CanvasSize=UDim2.new(0,0,0, bodyL.AbsoluteContentSize.Y+24)
                 settingsBox.Size=UDim2.new(1,0,0, settingsLL.AbsoluteContentSize.Y+4)
@@ -687,23 +692,26 @@ end
 --  IT PICKER
 -- 
 pickItPlayer = function()
-    -- weighted random for real games; players who were IT recently are less likely
-    local totalW = 0
+    -- debug mode: if bot is in party, YOU are always IT so ESP/tag works immediately
+    local botInParty = false
     for _, p in pairs(STATE.party) do
-        totalW = totalW + (1 / (STATE.itWeights[p.Name] or 1))
+        if p.Name:sub(1,4) == "Bot_" then botInParty = true; break end
     end
-    local roll = math.random() * totalW
-    local cum  = 0
-    for _, p in pairs(STATE.party) do
-        cum = cum + (1 / (STATE.itWeights[p.Name] or 1))
-        if roll <= cum then
-            STATE.itPlayer = p
-            break
+
+    if botInParty then
+        STATE.itPlayer = LP
+    else
+        -- weighted random for real games
+        local totalW = 0
+        for _, p in pairs(STATE.party) do
+            totalW = totalW + (1 / (STATE.itWeights[p.Name] or 1))
         end
-    end
-    -- safety fallback
-    if not STATE.itPlayer then
-        STATE.itPlayer = STATE.party[1]
+        local roll = math.random() * totalW
+        local cum  = 0
+        for _, p in pairs(STATE.party) do
+            cum = cum + (1 / (STATE.itWeights[p.Name] or 1))
+            if roll <= cum then STATE.itPlayer = p; break end
+        end
     end
 
     STATE.itWeights[STATE.itPlayer.Name] = (STATE.itWeights[STATE.itPlayer.Name] or 1) * 2
