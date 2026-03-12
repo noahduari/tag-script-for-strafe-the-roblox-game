@@ -12,74 +12,200 @@ local SoundService = game:GetService("SoundService")
 local LP           = Players.LocalPlayer
 
 --
---  PIN ROOM SYSTEM
---  _G.StrafeRooms[PIN] = { host, members, settings, state }
---  Any client can read/write rooms by PIN
+--  PIN ROOM SYSTEM  v2
+--  Uses ReplicatedStorage StringValues as a shared message bus.
+--  Works across ALL executors because ReplicatedStorage is a real
+--  Roblox service visible to every client in the same server.
 --
-_G.StrafeRooms = _G.StrafeRooms or {}
-local Rooms = _G.StrafeRooms
+--  Layout:
+--    ReplicatedStorage
+--      StrafeTagRooms/          <- Folder (created by first script user)
+--        [PIN]/                 <- Folder per room
+--          host    StringValue
+--          members StringValue  (comma-separated names)
+--          state   StringValue  (lobby | playing | end)
+--          itPlayer StringValue
+--          scores  StringValue  (name:n,name:n,...)
+--          itWeights StringValue
+--          settings StringValue (rounds:n,useTimer:b,timerSecs:n)
+--
 
-local myRoom   = nil   -- PIN string of room we're in
-local isHost   = false
+local RS = game:GetService("ReplicatedStorage")
 
-local function getRoom() return myRoom and Rooms[myRoom] end
+-- get or create the rooms folder
+local function getRoomsFolder()
+    local f = RS:FindFirstChild("StrafeTagRooms")
+    if not f then
+        f = Instance.new("Folder")
+        f.Name = "StrafeTagRooms"
+        f.Parent = RS
+    end
+    return f
+end
+
+local function sv(parent, name, default)
+    local v = parent:FindFirstChild(name)
+    if not v then
+        v = Instance.new("StringValue")
+        v.Name = name
+        v.Value = default or ""
+        v.Parent = parent
+    end
+    return v
+end
+
+-- encode/decode helpers (no JSON needed)
+local function encodeMembers(t)
+    return table.concat(t, ",")
+end
+local function decodeMembers(s)
+    if s=="" then return {} end
+    local out={}
+    for n in s:gmatch("[^,]+") do table.insert(out,n) end
+    return out
+end
+local function encodeKV(t)  -- {key=val,...} -> "key:val,key:val"
+    local parts={}
+    for k,v in pairs(t) do table.insert(parts,k..":"..tostring(v)) end
+    return table.concat(parts,",")
+end
+local function decodeKV(s)
+    local out={}
+    for pair in s:gmatch("[^,]+") do
+        local k,v=pair:match("^(.+):(.+)$")
+        if k then out[k]=v end
+    end
+    return out
+end
+
+-- room folder accessors
+local function roomFolder(pin)
+    return getRoomsFolder():FindFirstChild(tostring(pin))
+end
+
+local function readRoom(pin)
+    local f=roomFolder(pin)
+    if not f then return nil end
+    local members=decodeMembers((f:FindFirstChild("members") or {Value=""}).Value)
+    local scoresRaw=decodeKV((f:FindFirstChild("scores") or {Value=""}).Value)
+    local weightsRaw=decodeKV((f:FindFirstChild("itWeights") or {Value=""}).Value)
+    local settingsRaw=decodeKV((f:FindFirstChild("settings") or {Value="rounds:1,useTimer:false,timerSecs:120"}).Value)
+    local scores={}; for k,v in pairs(scoresRaw) do scores[k]=tonumber(v) or 0 end
+    local weights={}; for k,v in pairs(weightsRaw) do weights[k]=tonumber(v) or 1 end
+    return {
+        host      = (f:FindFirstChild("host") or {Value=""}).Value,
+        members   = members,
+        state     = (f:FindFirstChild("state") or {Value="lobby"}).Value,
+        itPlayer  = (f:FindFirstChild("itPlayer") or {Value=""}).Value,
+        scores    = scores,
+        itWeights = weights,
+        settings  = {
+            rounds   = tonumber(settingsRaw.rounds) or 1,
+            useTimer = settingsRaw.useTimer=="true",
+            timerSecs= tonumber(settingsRaw.timerSecs) or 120,
+        },
+    }
+end
+
+local function writeRoom(pin, data)
+    local folder=getRoomsFolder()
+    local f=folder:FindFirstChild(tostring(pin))
+    if not f then
+        f=Instance.new("Folder"); f.Name=tostring(pin); f.Parent=folder
+    end
+    sv(f,"host",data.host).Value         = data.host or ""
+    sv(f,"members","").Value             = encodeMembers(data.members or {})
+    sv(f,"state","lobby").Value          = data.state or "lobby"
+    sv(f,"itPlayer","").Value            = data.itPlayer or ""
+    sv(f,"scores","").Value              = encodeKV(data.scores or {})
+    sv(f,"itWeights","").Value           = encodeKV(data.itWeights or {})
+    sv(f,"settings","").Value            = encodeKV({
+        rounds   = data.settings and data.settings.rounds or 1,
+        useTimer = data.settings and tostring(data.settings.useTimer) or "false",
+        timerSecs= data.settings and data.settings.timerSecs or 120,
+    })
+end
+
+local function deleteRoom(pin)
+    local f=roomFolder(pin)
+    if f then f:Destroy() end
+end
+
+-- local state
+local myRoom  = nil
+local isHost  = false
+
+local function getRoom() return myRoom and readRoom(myRoom) end
+
+local function patchRoom(fn)
+    -- read-modify-write
+    if not myRoom then return end
+    local data=readRoom(myRoom)
+    if not data then return end
+    fn(data)
+    writeRoom(myRoom, data)
+end
 
 local function createRoom()
-    local pin = tostring(math.random(1000, 9999))
-    -- ensure unique
-    while Rooms[pin] do pin = tostring(math.random(1000, 9999)) end
-    Rooms[pin] = {
-        host     = LP.Name,
-        members  = { LP.Name },
-        settings = { rounds=1, useTimer=false, timerSecs=120 },
-        state    = "lobby",   -- lobby | playing | end
-        itPlayer = nil,
-        scores   = {},
-        itWeights= {},
-    }
-    myRoom = pin
-    isHost = true
+    local pin=tostring(math.random(1000,9999))
+    while roomFolder(pin) do pin=tostring(math.random(1000,9999)) end
+    writeRoom(pin,{
+        host="",members={LP.Name},state="lobby",itPlayer="",
+        scores={[LP.Name]=0},itWeights={[LP.Name]=1},
+        settings={rounds=1,useTimer=false,timerSecs=120},
+    })
+    -- write host separately after folder exists
+    local f=roomFolder(pin)
+    if f then sv(f,"host",LP.Name).Value=LP.Name end
+    myRoom=pin; isHost=true
     return pin
 end
 
 local function joinRoom(pin)
-    local room = Rooms[pin]
-    if not room then return false, "Room not found" end
-    if room.state ~= "lobby" then return false, "Game already started" end
-    if #room.members >= 8 then return false, "Room is full" end
-    for _, n in pairs(room.members) do
-        if n == LP.Name then return false, "Already in room" end
+    local f=roomFolder(pin)
+    if not f then return false,"Room not found" end
+    local data=readRoom(pin)
+    if not data then return false,"Room not found" end
+    if data.state~="lobby" then return false,"Game already started" end
+    for _,n in pairs(data.members) do
+        if n==LP.Name then return false,"Already in room" end
     end
-    table.insert(room.members, LP.Name)
-    myRoom = pin
-    isHost = false
+    table.insert(data.members,LP.Name)
+    data.scores[LP.Name]=0
+    data.itWeights[LP.Name]=1
+    writeRoom(pin,data)
+    myRoom=pin; isHost=false
     return true
 end
 
 local function leaveRoom()
-    local room = getRoom()
-    if not room then return end
-    for i, n in ipairs(room.members) do
-        if n == LP.Name then table.remove(room.members, i); break end
-    end
-    if room.host == LP.Name then
-        -- pass host or destroy
-        if #room.members > 0 then
-            room.host = room.members[1]
+    if not myRoom then return end
+    local data=readRoom(myRoom)
+    if data then
+        for i,n in ipairs(data.members) do
+            if n==LP.Name then table.remove(data.members,i); break end
+        end
+        if data.host==LP.Name then
+            if #data.members>0 then
+                data.host=data.members[1]
+                writeRoom(myRoom,data)
+            else
+                deleteRoom(myRoom)
+            end
         else
-            Rooms[myRoom] = nil
+            writeRoom(myRoom,data)
         end
     end
-    myRoom = nil; isHost = false
+    myRoom=nil; isHost=false
 end
 
 local function getRoomPlayers()
-    local room = getRoom()
-    if not room then return {} end
-    local out = {}
-    for _, name in pairs(room.members) do
-        local p = Players:FindFirstChild(name)
-        if p then table.insert(out, p) end
+    local data=getRoom()
+    if not data then return {} end
+    local out={}
+    for _,name in pairs(data.members) do
+        local p=Players:FindFirstChild(name)
+        if p then table.insert(out,p) end
     end
     return out
 end
@@ -631,15 +757,16 @@ do
         local room=getRoom()
         if not room then return end
         if #room.members<2 then toast("Need at least 2 players!",C.danger); return end
-        room.settings.rounds   = getRounds()
-        room.settings.useTimer = getTimer()
-        room.settings.timerSecs= getTimerDur()
-        room.state="playing"
-        -- init weights and scores
-        for _,name in pairs(room.members) do
-            room.itWeights[name] = room.itWeights[name] or 1.0
-            room.scores[name]    = room.scores[name] or 0
-        end
+        patchRoom(function(data)
+            data.settings.rounds   = getRounds()
+            data.settings.useTimer = getTimer()
+            data.settings.timerSecs= getTimerDur()
+            data.state="playing"
+            for _,name in pairs(data.members) do
+                data.itWeights[name] = data.itWeights[name] or 1.0
+                data.scores[name]    = data.scores[name] or 0
+            end
+        end)
         startGame()
     end)
 
@@ -732,9 +859,11 @@ do
         local room=getRoom()
         if room then
             STATE.roundNum=1; STATE.itPlayer=nil
-            for k in pairs(room.scores) do room.scores[k]=0 end
-            for k in pairs(room.itWeights) do room.itWeights[k]=1.0 end
-            room.state="playing"
+            patchRoom(function(data)
+                for k in pairs(data.scores) do data.scores[k]=0 end
+                for k in pairs(data.itWeights) do data.itWeights[k]=1.0 end
+                data.state="playing"
+            end)
             startGame()
         end
     end)
@@ -832,9 +961,11 @@ local function doTag(tagged)
     if not room then return end
 
     STATE.itPlayer=tagged
-    room.itPlayer=tagged.Name
-    room.scores[tagged.Name]=(room.scores[tagged.Name] or 0)+1
-    room.itWeights[tagged.Name]=(room.itWeights[tagged.Name] or 1)*2
+    patchRoom(function(data)
+        data.itPlayer=tagged.Name
+        data.scores[tagged.Name]=(data.scores[tagged.Name] or 0)+1
+        data.itWeights[tagged.Name]=(data.itWeights[tagged.Name] or 1)*2
+    end)
 
     playSound(SFX.tag,4)
     toast("TAGGED "..tagged.Name.."!",C.safe,2)
@@ -866,29 +997,27 @@ end
 -- =====================================================
 --
 local function pickIT()
-    local room=getRoom()
-    if not room then return end
+    local data=getRoom()
+    if not data then return end
     local party=getRoomPlayers()
     if #party==0 then return end
 
     local totalW=0
     for _,p in pairs(party) do
-        totalW=totalW+(1/(room.itWeights[p.Name] or 1))
+        totalW=totalW+(1/(data.itWeights[p.Name] or 1))
     end
     local roll=math.random()*totalW
     local cum=0
+    local picked=party[1]
     for _,p in pairs(party) do
-        cum=cum+(1/(room.itWeights[p.Name] or 1))
-        if roll<=cum then
-            STATE.itPlayer=p
-            room.itPlayer=p.Name
-            room.itWeights[p.Name]=(room.itWeights[p.Name] or 1)*2
-            return
-        end
+        cum=cum+(1/(data.itWeights[p.Name] or 1))
+        if roll<=cum then picked=p; break end
     end
-    -- fallback
-    STATE.itPlayer=party[1]
-    room.itPlayer=party[1].Name
+    STATE.itPlayer=picked
+    patchRoom(function(d)
+        d.itPlayer=picked.Name
+        d.itWeights[picked.Name]=(d.itWeights[picked.Name] or 1)*2
+    end)
 end
 
 startGame=function()
@@ -1016,11 +1145,12 @@ endRound=function()
     end
 
     -- game over
-    room.state="end"
+    patchRoom(function(data) data.state="end" end)
+    local room=getRoom() or {}
     showScreen("endscreen"); playSound(SFX.win,2)
 
     local winner,minT=nil,math.huge
-    for name,t in pairs(room.scores) do
+    for name,t in pairs(room.scores or {}) do
         if t<minT then minT=t; winner=name end
     end
     if endRefs.winnerLbl then
@@ -1031,7 +1161,7 @@ endRound=function()
             if c:IsA("Frame") then c:Destroy() end
         end
         local sorted={}
-        for name,t in pairs(room.scores) do table.insert(sorted,{name=name,tags=t}) end
+        for name,t in pairs(room.scores or {}) do table.insert(sorted,{name=name,tags=t}) end
         table.sort(sorted,function(a,b) return a.tags<b.tags end)
         for rank,entry in ipairs(sorted) do
             local isW=(entry.name==winner)
